@@ -27,6 +27,7 @@ package sun.nio.ch;
 
 import java.nio.channels.spi.AsynchronousChannelProvider;
 import java.io.IOException;
+import java.util.Queue;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -34,7 +35,6 @@ import java.util.concurrent.atomic.AtomicInteger;
 import static sun.nio.ch.EPoll.EPOLLIN;
 import static sun.nio.ch.EPoll.EPOLLONESHOT;
 import static sun.nio.ch.EPoll.EPOLL_CTL_ADD;
-import static sun.nio.ch.EPoll.EPOLL_CTL_DEL;
 import static sun.nio.ch.EPoll.EPOLL_CTL_MOD;
 
 
@@ -56,6 +56,7 @@ final class EPollPort
 
     // address of the poll array passed to epoll_wait
     private final long address;
+    private final long secondaryAddress;
 
     // true if epoll closed
     private boolean closed;
@@ -83,7 +84,9 @@ final class EPollPort
     // queue of events for cases that a polling thread dequeues more than one
     // event
     private final ArrayBlockingQueue<Event> queue;
+    private final ArrayBlockingQueue<Event> secondaryQueue;
     private final Event NEED_TO_POLL = new Event(null, 0);
+    private final Event SECONDARY_POLL = new Event(null, 0);
     private final Event EXECUTE_TASK_OR_SHUTDOWN = new Event(null, 0);
 
     EPollPort(AsynchronousChannelProvider provider, ThreadPool pool)
@@ -93,6 +96,7 @@ final class EPollPort
 
         this.epfd = EPoll.create();
         this.address = EPoll.allocatePollArray(MAX_EPOLL_EVENTS);
+        this.secondaryAddress = EPoll.allocatePollArray(MAX_EPOLL_EVENTS);
 
         // create socket pair for wakeup mechanism
         try {
@@ -100,6 +104,7 @@ final class EPollPort
             this.sp = new int[]{(int) (fds >>> 32), (int) fds};
         } catch (IOException ioe) {
             EPoll.freePollArray(address);
+            EPoll.freePollArray(secondaryAddress);
             FileDispatcherImpl.closeIntFD(epfd);
             throw ioe;
         }
@@ -110,6 +115,7 @@ final class EPollPort
         // create the queue and offer the special event to ensure that the first
         // threads polls
         this.queue = new ArrayBlockingQueue<>(MAX_EPOLL_EVENTS);
+        this.secondaryQueue = new ArrayBlockingQueue<>(MAX_EPOLL_EVENTS);
         this.queue.offer(NEED_TO_POLL);
     }
 
@@ -131,6 +137,7 @@ final class EPollPort
         try { FileDispatcherImpl.closeIntFD(sp[0]); } catch (IOException ioe) { }
         try { FileDispatcherImpl.closeIntFD(sp[1]); } catch (IOException ioe) { }
         EPoll.freePollArray(address);
+        EPoll.freePollArray(secondaryAddress);
     }
 
     private void wakeup() {
@@ -192,65 +199,85 @@ final class EPollPort
      * been consumed.
      */
     private class EventHandlerTask implements Runnable {
-        private Event poll() throws IOException {
-            try {
-                for (;;) {
-                    int n;
-                    do {
-                        n = EPoll.wait(epfd, address, MAX_EPOLL_EVENTS, -1);
-                    } while (n == IOStatus.INTERRUPTED);
 
-                    /**
-                     * 'n' events have been read. Here we map them to their
-                     * corresponding channel in batch and queue n-1 so that
-                     * they can be handled by other handler threads. The last
-                     * event is handled by this thread (and so is not queued).
-                     */
-                    fdToChannelLock.readLock().lock();
-                    try {
-                        while (n-- > 0) {
-                            long eventAddress = EPoll.getEvent(address, n);
-                            int fd = EPoll.getDescriptor(eventAddress);
+        private Event poll(Queue<Event> eventQueue, long pollAddress) throws IOException {
+            for (;;) {
+                int n;
+                do {
+                    n = EPoll.wait(epfd, pollAddress, MAX_EPOLL_EVENTS, -1);
+                } while (n == IOStatus.INTERRUPTED);
 
-                            // wakeup
-                            if (fd == sp[0]) {
-                                if (wakeupCount.decrementAndGet() == 0) {
-                                    // consume one wakeup byte, never more as this
-                                    // would interfere with shutdown when there is
-                                    // a wakeup byte queued to wake each thread
-                                    int nread;
-                                    do {
-                                        nread = IOUtil.drain1(sp[0]);
-                                    } while (nread == IOStatus.INTERRUPTED);
-                                }
+                /**
+                 * 'n' events have been read. Here we map them to their
+                 * corresponding channel in batch and queue n-1 so that
+                 * they can be handled by other handler threads. The last
+                 * event is handled by this thread (and so is not queued).
+                 */
+                fdToChannelLock.readLock().lock();
+                try {
+                    while (n-- > 0) {
+                        long eventAddress = EPoll.getEvent(pollAddress, n);
+                        int fd = EPoll.getDescriptor(eventAddress);
 
-                                // queue special event if there are more events
-                                // to handle.
-                                if (n > 0) {
-                                    queue.offer(EXECUTE_TASK_OR_SHUTDOWN);
-                                    continue;
-                                }
-                                return EXECUTE_TASK_OR_SHUTDOWN;
+                        if(n < (threadCount() + 4) * 1.5f) {
+                            eventQueue.offer(SECONDARY_POLL);
+                        }
+
+                        // wakeup
+                        if (fd == sp[0]) {
+                            if (wakeupCount.decrementAndGet() == 0) {
+                                // consume one wakeup byte, never more as this
+                                // would interfere with shutdown when there is
+                                // a wakeup byte queued to wake each thread
+                                int nread;
+                                do {
+                                    nread = IOUtil.drain1(sp[0]);
+                                } while (nread == IOStatus.INTERRUPTED);
                             }
 
-                            PollableChannel channel = fdToChannel.get(fd);
-                            if (channel != null) {
-                                int events = EPoll.getEvents(eventAddress);
-                                Event ev = new Event(channel, events);
+                            // queue special event if there are more events
+                            // to handle.
+                            if (n > 0) {
+                                eventQueue.offer(EXECUTE_TASK_OR_SHUTDOWN);
+                                continue;
+                            }
+                            return EXECUTE_TASK_OR_SHUTDOWN;
+                        }
 
-                                // n-1 events are queued; This thread handles
-                                // the last one except for the wakeup
-                                if (n > 0) {
-                                    queue.offer(ev);
-                                } else {
-                                    return ev;
-                                }
+                        PollableChannel channel = fdToChannel.get(fd);
+                        if (channel != null) {
+                            int events = EPoll.getEvents(eventAddress);
+                            Event ev = new Event(channel, events);
+
+                            // n-1 events are queued; This thread handles
+                            // the last one except for the wakeup
+                            if (n > 0) {
+                                eventQueue.offer(ev);
+                            } else {
+                                return ev;
                             }
                         }
-                    } finally {
-                        fdToChannelLock.readLock().unlock();
                     }
+                } finally {
+                    fdToChannelLock.readLock().unlock();
                 }
+            }
+        }
+
+        private void secondaryPoll() throws IOException {
+            Event ev = poll(secondaryQueue, secondaryAddress);
+            secondaryQueue.offer(ev);
+        }
+
+        private Event poll() throws IOException {
+            try {
+                if(!secondaryQueue.isEmpty()) {
+                    while (secondaryQueue.size() > 1) {
+                        queue.offer(secondaryQueue.poll());
+                    }
+                    return secondaryQueue.poll();
+                }
+                return poll(queue, address);
             } finally {
                 // to ensure that some thread will poll when all events have
                 // been consumed
@@ -283,6 +310,15 @@ final class EPollPort
                                 x.printStackTrace();
                                 return;
                             }
+                        }
+
+                        if(ev == SECONDARY_POLL) {
+                            try {
+                                secondaryPoll();
+                            } catch (IOException x) {
+                                x.printStackTrace();
+                            }
+                            continue;
                         }
                     } catch (InterruptedException x) {
                         continue;
