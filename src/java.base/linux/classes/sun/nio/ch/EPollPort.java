@@ -266,7 +266,7 @@ final class EPollPort
             }
         }
 
-        private void secondaryPoll() throws IOException {
+        private synchronized void secondaryPoll() throws IOException {
             Event ev = poll(secondaryQueue, secondaryAddress);
             secondaryQueue.offer(ev);
         }
