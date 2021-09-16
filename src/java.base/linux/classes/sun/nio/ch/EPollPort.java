@@ -215,12 +215,14 @@ final class EPollPort
                  */
                 fdToChannelLock.readLock().lock();
                 try {
+                    boolean useSecondaryPoll = n > threadCount() << 2;
                     while (n-- > 0) {
                         long eventAddress = EPoll.getEvent(pollAddress, n);
                         int fd = EPoll.getDescriptor(eventAddress);
 
-                        if(n < (threadCount() + 4) * 1.5f) {
+                        if(useSecondaryPoll && n < threadCount() + 2) {
                             eventQueue.offer(SECONDARY_POLL);
+                            useSecondaryPoll = false;
                         }
 
                         // wakeup
