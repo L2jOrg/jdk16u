@@ -217,8 +217,9 @@ final class EPollPort
                  */
                 fdToChannelLock.readLock().lock();
                 try {
-                    boolean useSecondaryPoll = n > threadCount() << 2;
-                    int secondaryThreshold = threadCount() + threadCount() >> 2;
+                    int threads = threadCount();
+                    boolean useSecondaryPoll = n > threads << 2;
+                    int secondaryThreshold = threads + (threads >> 2);
                     while (n-- > 0) {
                         long eventAddress = EPoll.getEvent(pollAddress, n);
                         int fd = EPoll.getDescriptor(eventAddress);
