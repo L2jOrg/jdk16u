@@ -218,11 +218,12 @@ final class EPollPort
                 fdToChannelLock.readLock().lock();
                 try {
                     boolean useSecondaryPoll = n > threadCount() << 2;
+                    int secondaryThreshold = threadCount() + threadCount() >> 2;
                     while (n-- > 0) {
                         long eventAddress = EPoll.getEvent(pollAddress, n);
                         int fd = EPoll.getDescriptor(eventAddress);
 
-                        if(useSecondaryPoll && n < threadCount() + 2) {
+                        if(useSecondaryPoll && n < secondaryThreshold) {
                             eventQueue.offer(SECONDARY_POLL);
                             useSecondaryPoll = false;
                         }
@@ -268,11 +269,16 @@ final class EPollPort
             }
         }
 
-        private void secondaryPoll() throws IOException {
+        private void secondaryPoll() {
             if(isSecondaryPolling.compareAndSet(false, true)) {
-                Event ev = poll(secondaryQueue, secondaryAddress);
-                secondaryQueue.offer(ev);
-                isSecondaryPolling.set(false);
+                try {
+                    Event ev = poll(secondaryQueue, secondaryAddress);
+                    secondaryQueue.offer(ev);
+                } catch (IOException e) {
+                    e.printStackTrace();
+                } finally {
+                    isSecondaryPolling.set(false);
+                }
             }
         }
 
@@ -320,11 +326,7 @@ final class EPollPort
                         }
 
                         if(ev == SECONDARY_POLL) {
-                            try {
-                                secondaryPoll();
-                            } catch (IOException x) {
-                                x.printStackTrace();
-                            }
+                            secondaryPoll();
                             continue;
                         }
                     } catch (InterruptedException x) {
