@@ -30,6 +30,7 @@ import java.io.IOException;
 import java.util.Queue;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static sun.nio.ch.EPoll.EPOLLIN;
@@ -66,6 +67,7 @@ final class EPollPort
 
     // number of wakeups pending
     private final AtomicInteger wakeupCount = new AtomicInteger();
+    private final AtomicBoolean isSecondaryPolling = new AtomicBoolean();
 
     // encapsulates an event for a channel
     static class Event {
@@ -266,9 +268,12 @@ final class EPollPort
             }
         }
 
-        private synchronized void secondaryPoll() throws IOException {
-            Event ev = poll(secondaryQueue, secondaryAddress);
-            secondaryQueue.offer(ev);
+        private void secondaryPoll() throws IOException {
+            if(isSecondaryPolling.compareAndSet(false, true)) {
+                Event ev = poll(secondaryQueue, secondaryAddress);
+                secondaryQueue.offer(ev);
+                isSecondaryPolling.set(false);
+            }
         }
 
         private Event poll() throws IOException {
